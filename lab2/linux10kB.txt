@@ -1,0 +1,321 @@
+Skip to content
+Search or jump to…
+Pull requests
+Issues
+Codespaces
+Marketplace
+Explore
+ 
+@Spontaniczny 
+torvalds
+/
+linux
+Public
+Fork your own copy of torvalds/linux
+Code
+Pull requests
+310
+Actions
+Projects
+Security
+Insights
+linux/scripts/mod/file2alias.c
+@andy-shev
+andy-shev modpost: Mark uuid_le type to be suitable only for MEI
+…
+Latest commit 2480432 on Nov 25, 2022
+ History
+ 92 contributors
+@torvalds@masahir0y@gregkh@rustyrussell@kaysievers@davem330@2pi@tomasbw@rydberg@Mani-Sadhasivam@kattisrinivasan@jtaprogge
+1608 lines (1377 sloc)  45.7 KB
+
+/* Simple code to turn various tables in an ELF file into alias definitions.
+ * This deals with kernel datastructures where they should be
+ * dealt with: in the kernel source.
+ *
+ * Copyright 2002-2003  Rusty Russell, IBM Corporation
+ *           2003       Kai Germaschewski
+ *
+ *
+ * This software may be used and distributed according to the terms
+ * of the GNU General Public License, incorporated herein by reference.
+ */
+
+#include "modpost.h"
+#include "devicetable-offsets.h"
+
+/* We use the ELF typedefs for kernel_ulong_t but bite the bullet and
+ * use either stdint.h or inttypes.h for the rest. */
+#if KERNEL_ELFCLASS == ELFCLASS32
+typedef Elf32_Addr	kernel_ulong_t;
+#define BITS_PER_LONG 32
+#else
+typedef Elf64_Addr	kernel_ulong_t;
+#define BITS_PER_LONG 64
+#endif
+#ifdef __sun__
+#include <inttypes.h>
+#else
+#include <stdint.h>
+#endif
+
+#include <ctype.h>
+#include <stdbool.h>
+
+typedef uint32_t	__u32;
+typedef uint16_t	__u16;
+typedef unsigned char	__u8;
+
+/* UUID types for backward compatibility, don't use in new code */
+typedef struct {
+	__u8 b[16];
+} guid_t;
+
+typedef struct {
+	__u8 b[16];
+} uuid_t;
+
+#define	UUID_STRING_LEN		36
+
+/* MEI UUID type, don't use anywhere else */
+typedef struct {
+	__u8 b[16];
+} uuid_le;
+
+/* Big exception to the "don't include kernel headers into userspace, which
+ * even potentially has different endianness and word sizes, since
+ * we handle those differences explicitly below */
+#include "../../include/linux/mod_devicetable.h"
+
+/* This array collects all instances that use the generic do_table */
+struct devtable {
+	const char *device_id; /* name of table, __mod_<name>__*_device_table. */
+	unsigned long id_size;
+	int (*do_entry)(const char *filename, void *symval, char *alias);
+};
+
+/* Size of alias provided to do_entry functions */
+#define ALIAS_SIZE 500
+
+/* Define a variable f that holds the value of field f of struct devid
+ * based at address m.
+ */
+#define DEF_FIELD(m, devid, f) \
+	typeof(((struct devid *)0)->f) f = TO_NATIVE(*(typeof(f) *)((m) + OFF_##devid##_##f))
+
+/* Define a variable v that holds the address of field f of struct devid
+ * based at address m.  Due to the way typeof works, for a field of type
+ * T[N] the variable has type T(*)[N], _not_ T*.
+ */
+#define DEF_FIELD_ADDR_VAR(m, devid, f, v) \
+	typeof(((struct devid *)0)->f) *v = ((m) + OFF_##devid##_##f)
+
+/* Define a variable f that holds the address of field f of struct devid
+ * based at address m.  Due to the way typeof works, for a field of type
+ * T[N] the variable has type T(*)[N], _not_ T*.
+ */
+#define DEF_FIELD_ADDR(m, devid, f) \
+	DEF_FIELD_ADDR_VAR(m, devid, f, f)
+
+#define ADD(str, sep, cond, field)                              \
+do {                                                            \
+        strcat(str, sep);                                       \
+        if (cond)                                               \
+                sprintf(str + strlen(str),                      \
+                        sizeof(field) == 1 ? "%02X" :           \
+                        sizeof(field) == 2 ? "%04X" :           \
+                        sizeof(field) == 4 ? "%08X" : "",       \
+                        field);                                 \
+        else                                                    \
+                sprintf(str + strlen(str), "*");                \
+} while(0)
+
+/* End in a wildcard, for future extension */
+static inline void add_wildcard(char *str)
+{
+	int len = strlen(str);
+
+	if (str[len - 1] != '*')
+		strcat(str + len, "*");
+}
+
+static inline void add_uuid(char *str, uuid_le uuid)
+{
+	int len = strlen(str);
+
+	sprintf(str + len, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		uuid.b[3], uuid.b[2], uuid.b[1], uuid.b[0],
+		uuid.b[5], uuid.b[4], uuid.b[7], uuid.b[6],
+		uuid.b[8], uuid.b[9], uuid.b[10], uuid.b[11],
+		uuid.b[12], uuid.b[13], uuid.b[14], uuid.b[15]);
+}
+
+static inline void add_guid(char *str, guid_t guid)
+{
+	int len = strlen(str);
+
+	sprintf(str + len, "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+		guid.b[3], guid.b[2], guid.b[1], guid.b[0],
+		guid.b[5], guid.b[4], guid.b[7], guid.b[6],
+		guid.b[8], guid.b[9], guid.b[10], guid.b[11],
+		guid.b[12], guid.b[13], guid.b[14], guid.b[15]);
+}
+
+/**
+ * Check that sizeof(device_id type) are consistent with size of section
+ * in .o file. If in-consistent then userspace and kernel does not agree
+ * on actual size which is a bug.
+ * Also verify that the final entry in the table is all zeros.
+ * Ignore both checks if build host differ from target host and size differs.
+ **/
+static void device_id_check(const char *modname, const char *device_id,
+			    unsigned long size, unsigned long id_size,
+			    void *symval)
+{
+	int i;
+
+	if (size % id_size || size < id_size) {
+		fatal("%s: sizeof(struct %s_device_id)=%lu is not a modulo of the size of section __mod_%s__<identifier>_device_table=%lu.\n"
+		      "Fix definition of struct %s_device_id in mod_devicetable.h\n",
+		      modname, device_id, id_size, device_id, size, device_id);
+	}
+	/* Verify last one is a terminator */
+	for (i = 0; i < id_size; i++ ) {
+		if (*(uint8_t*)(symval+size-id_size+i)) {
+			fprintf(stderr,
+				"%s: struct %s_device_id is %lu bytes.  The last of %lu is:\n",
+				modname, device_id, id_size, size / id_size);
+			for (i = 0; i < id_size; i++ )
+				fprintf(stderr,"0x%02x ",
+					*(uint8_t*)(symval+size-id_size+i) );
+			fprintf(stderr,"\n");
+			fatal("%s: struct %s_device_id is not terminated with a NULL entry!\n",
+			      modname, device_id);
+		}
+	}
+}
+
+/* USB is special because the bcdDevice can be matched against a numeric range */
+/* Looks like "usb:vNpNdNdcNdscNdpNicNiscNipNinN" */
+static void do_usb_entry(void *symval,
+			 unsigned int bcdDevice_initial, int bcdDevice_initial_digits,
+			 unsigned char range_lo, unsigned char range_hi,
+			 unsigned char max, struct module *mod)
+{
+	char alias[500];
+	DEF_FIELD(symval, usb_device_id, match_flags);
+	DEF_FIELD(symval, usb_device_id, idVendor);
+	DEF_FIELD(symval, usb_device_id, idProduct);
+	DEF_FIELD(symval, usb_device_id, bcdDevice_lo);
+	DEF_FIELD(symval, usb_device_id, bDeviceClass);
+	DEF_FIELD(symval, usb_device_id, bDeviceSubClass);
+	DEF_FIELD(symval, usb_device_id, bDeviceProtocol);
+	DEF_FIELD(symval, usb_device_id, bInterfaceClass);
+	DEF_FIELD(symval, usb_device_id, bInterfaceSubClass);
+	DEF_FIELD(symval, usb_device_id, bInterfaceProtocol);
+	DEF_FIELD(symval, usb_device_id, bInterfaceNumber);
+
+	strcpy(alias, "usb:");
+	ADD(alias, "v", match_flags&USB_DEVICE_ID_MATCH_VENDOR,
+	    idVendor);
+	ADD(alias, "p", match_flags&USB_DEVICE_ID_MATCH_PRODUCT,
+	    idProduct);
+
+	strcat(alias, "d");
+	if (bcdDevice_initial_digits)
+		sprintf(alias + strlen(alias), "%0*X",
+			bcdDevice_initial_digits, bcdDevice_initial);
+	if (range_lo == range_hi)
+		sprintf(alias + strlen(alias), "%X", range_lo);
+	else if (range_lo > 0 || range_hi < max) {
+		if (range_lo > 0x9 || range_hi < 0xA)
+			sprintf(alias + strlen(alias),
+				"[%X-%X]",
+				range_lo,
+				range_hi);
+		else {
+			sprintf(alias + strlen(alias),
+				range_lo < 0x9 ? "[%X-9" : "[%X",
+				range_lo);
+			sprintf(alias + strlen(alias),
+				range_hi > 0xA ? "A-%X]" : "%X]",
+				range_hi);
+		}
+	}
+	if (bcdDevice_initial_digits < (sizeof(bcdDevice_lo) * 2 - 1))
+		strcat(alias, "*");
+
+	ADD(alias, "dc", match_flags&USB_DEVICE_ID_MATCH_DEV_CLASS,
+	    bDeviceClass);
+	ADD(alias, "dsc", match_flags&USB_DEVICE_ID_MATCH_DEV_SUBCLASS,
+	    bDeviceSubClass);
+	ADD(alias, "dp", match_flags&USB_DEVICE_ID_MATCH_DEV_PROTOCOL,
+	    bDeviceProtocol);
+	ADD(alias, "ic", match_flags&USB_DEVICE_ID_MATCH_INT_CLASS,
+	    bInterfaceClass);
+	ADD(alias, "isc", match_flags&USB_DEVICE_ID_MATCH_INT_SUBCLASS,
+	    bInterfaceSubClass);
+	ADD(alias, "ip", match_flags&USB_DEVICE_ID_MATCH_INT_PROTOCOL,
+	    bInterfaceProtocol);
+	ADD(alias, "in", match_flags&USB_DEVICE_ID_MATCH_INT_NUMBER,
+	    bInterfaceNumber);
+
+	add_wildcard(alias);
+	buf_printf(&mod->dev_table_buf,
+		   "MODULE_ALIAS(\"%s\");\n", alias);
+}
+
+{
+	unsigned int init = *bcd, i, j;
+	unsigned long long c, dec = 0;
+
+	/* If bcd is not in BCD format, just increment */
+	if (max > 0x9) {
+		*bcd += inc;
+		return init;
+	}
+
+	/* Convert BCD to Decimal */
+	for (i=0 ; i < chars ; i++) {
+		c = (*bcd >> (i << 2)) & 0xf;
+		c = c > 9 ? 9 : c; /* force to bcd just in case */
+		for (j=0 ; j < i ; j++)
+			c = c * 10;
+		dec += c;
+	}
+
+	/* Do our increment/decrement */
+	dec += inc;
+	*bcd  = 0;
+
+	/* Convert back to BCD */
+	for (i=0 ; i < chars ; i++) {
+		for (c=1,j=0 ; j < i ; j++)
+			c = c * 10;
+		c = (dec / c) % 10;
+		*bcd += c << (i << 2);
+	}
+	return init;
+}
+
+	devlo = match_flags & USB_DEVICE_ID_MATCH_DEV_LO ?
+		bcdDevice_lo : 0x0U;
+	devhi = match_flags & USB_DEVICE_ID_MATCH_DEV_HI ?
+		bcdDevice_hi : ~0x0U;
+
+	/* Figure out if this entry is in bcd or hex format */
+	max = 0x9; /* Default to decimal format */
+	for (ndigits = 0 ; ndigits < sizeof(bcdDevice_lo) * 2 ; ndigits++) {
+		clo = (devlo >> (ndigits << 2)) & 0xf;
+		chi = ((devhi > 0x9999 ? 0x9999 : devhi) >> (ndigits << 2)) & 0xf;
+		if (clo > max || chi > max) {
+
+
+static void dmi_ascii_filter(char *d, const char *s)
+{
+	/* Filter out characters we don't want to see in the modalias string */
+	for (; *s; s++)
+		if (*s > ' ' && *s < 127 && *s != ':')
+			*(d++) = *s;
+
+	*d = 0;
